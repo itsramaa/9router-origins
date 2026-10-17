@@ -481,6 +481,60 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     }
   }
 
+  // Retry once on invalid thinking param — opencode family has mixed support
+  // per-model (glm-5.3-flash-free 400s on `thinking`, others need it).
+  if (!providerResponse.ok && providerResponse.status === 400) {
+    let needRetry = false;
+    try {
+      const raw = await providerResponse.clone().text();
+      const lower = raw.toLowerCase();
+      if (lower.includes('"thinking"') && (lower.includes("unknown field") || lower.includes("unknown parameter") || lower.includes("invalid_request"))) {
+        needRetry = true;
+      }
+    } catch { /* clone failed — skip retry */ }
+    if (needRetry && translatedBody && typeof translatedBody === "object") {
+      log?.warn?.("THINKING", `retry without thinking for ${provider}/${model} (400 unknown field thinking)`);
+      // Strip all thinking wire shapes before retry
+      delete translatedBody.thinking;
+      delete translatedBody.reasoning_effort;
+      delete translatedBody.reasoning;
+      delete translatedBody.thinkingConfig;
+      delete translatedBody.enable_thinking;
+      delete translatedBody.thinking_budget;
+      delete translatedBody.output_config;
+      if (translatedBody.generationConfig) delete translatedBody.generationConfig.thinkingConfig;
+      if (translatedBody.request?.generationConfig) delete translatedBody.request.generationConfig.thinkingConfig;
+      if (translatedBody.params && typeof translatedBody.params === "object") {
+        delete translatedBody.params.reasoning_effort;
+        delete translatedBody.params.thinking;
+      }
+      try {
+        const retryResult = await executor.execute({
+          model,
+          body: translatedBody,
+          stream,
+          credentials,
+          providerSessionId: sessionSeed,
+          clientTool,
+          signal: streamController.signal,
+          log,
+          proxyOptions,
+          providerOverrides,
+        });
+        providerResponse = retryResult.response;
+        providerUrl = retryResult.url;
+        providerHeaders = retryResult.headers;
+        finalBody = retryResult.transformedBody;
+        providerResponseFormat = retryResult.responseFormat || targetFormat;
+        if (providerResponse.ok) {
+          log?.info?.("THINKING", `retry succeeded without thinking for ${provider}/${model}`);
+        }
+      } catch (e) {
+        log?.warn?.("THINKING", `retry without thinking failed: ${e.message}`);
+      }
+    }
+  }
+
   // Provider returned error
   if (!providerResponse.ok) {
     trackPendingRequest(model, provider, connectionId, false, true);
